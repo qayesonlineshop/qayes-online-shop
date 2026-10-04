@@ -1,14 +1,13 @@
-# Qayes Online Shop - Render Ready
+# Qayes Admin + Payment Settings v3
 
-Render settings:
-- Runtime: Python 3
-- Build Command: `pip install -r requirements.txt`
-- Start Command: `gunicorn app:app`
-- Root Directory: leave empty
+Render:
+- Build: `pip install -r requirements.txt`
+- Start: `gunicorn app:app`
+- Add Environment Variable `ADMIN_KEY` with a strong secret.
 
-Endpoints:
-- `/`
-- `/health`
-- `/api/v1/products`
+Admin page: `/admin`
 
+Payment toggles included: Card, bKash, Nagad, COD.
 Currency: BDT only.
+
+Note: Card/bKash/Nagad live payments require approved merchant/gateway credentials. This starter does not store card numbers or CVV.
