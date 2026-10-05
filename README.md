@@ -1,6 +1,5 @@
-# Qayes Admin v4
-Add, edit and delete BDT products.
-Admin page: /admin
-Render build: pip install -r requirements.txt
-Render start: gunicorn app:app
-Note: SQLite on a free Render web service is not permanent after replacement/redeploy. PostgreSQL should be connected for permanent storage.
+# Qayes Online Shop Admin + Payment Settings v5
+
+BDT-only admin starter with product add/edit/delete, shop name, delivery charge, and payment method toggles for Card, bKash, Nagad and COD.
+
+Real card/bKash/Nagad transactions require merchant/gateway credentials. Never store card number or CVV in this app.
