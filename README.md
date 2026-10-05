@@ -1,13 +1,6 @@
-# Qayes Admin + Payment Settings v3
-
-Render:
-- Build: `pip install -r requirements.txt`
-- Start: `gunicorn app:app`
-- Add Environment Variable `ADMIN_KEY` with a strong secret.
-
-Admin page: `/admin`
-
-Payment toggles included: Card, bKash, Nagad, COD.
-Currency: BDT only.
-
-Note: Card/bKash/Nagad live payments require approved merchant/gateway credentials. This starter does not store card numbers or CVV.
+# Qayes Admin v4
+Add, edit and delete BDT products.
+Admin page: /admin
+Render build: pip install -r requirements.txt
+Render start: gunicorn app:app
+Note: SQLite on a free Render web service is not permanent after replacement/redeploy. PostgreSQL should be connected for permanent storage.
