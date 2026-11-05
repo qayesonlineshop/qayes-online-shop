@@ -1,409 +1,176 @@
-import os
-import sqlite3
+import os, sqlite3, uuid
+from pathlib import Path
 from flask import Flask, jsonify, request, render_template_string
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-
-DB_PATH = os.environ.get("DATABASE_PATH", "qayes.db")
+ROOT = Path(__file__).resolve().parent
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(ROOT / "static" / "uploads")))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+DB = os.environ.get("DATABASE_PATH", str(ROOT / "qayes.db"))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-me")
+ALLOWED = {"jpg", "jpeg", "png", "webp", "gif"}
 
+def db():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
 
-def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def init():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS products(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, category TEXT DEFAULT '',
+        description TEXT DEFAULT '', price_bdt REAL NOT NULL DEFAULT 0,
+        stock INTEGER NOT NULL DEFAULT 0, image_url TEXT DEFAULT '', active INTEGER DEFAULT 1)""")
+        c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        defaults = {"shop_name":"Qayes Online Shop","delivery_charge_bdt":"60",
+                    "card_enabled":"1","bkash_enabled":"1","nagad_enabled":"1","cod_enabled":"1"}
+        for k,v in defaults.items():
+            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
 
+def settings():
+    with db() as c:
+        return {r["key"]:r["value"] for r in c.execute("SELECT key,value FROM settings")}
 
-def init_db():
-    with connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                category TEXT DEFAULT '',
-                description TEXT DEFAULT '',
-                price_bdt REAL NOT NULL DEFAULT 0,
-                stock INTEGER NOT NULL DEFAULT 0,
-                image_url TEXT DEFAULT '',
-                active INTEGER NOT NULL DEFAULT 1
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        defaults = {
-            "shop_name": "Qayes Online Shop",
-            "delivery_charge_bdt": "60",
-            "card_enabled": "1",
-            "bkash_enabled": "1",
-            "nagad_enabled": "1",
-            "cod_enabled": "1",
-        }
-        for key, value in defaults.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
-                (key, value),
-            )
+def save_image(f):
+    if not f or not f.filename:
+        return ""
+    ext = f.filename.rsplit(".",1)[-1].lower() if "." in f.filename else ""
+    if ext not in ALLOWED:
+        raise ValueError("ছবি JPG, PNG, WEBP অথবা GIF হতে হবে।")
+    name = secure_filename(Path(f.filename).stem)[:35] or "product"
+    filename = f"{name}-{uuid.uuid4().hex[:10]}.{ext}"
+    f.save(UPLOAD_DIR / filename)
+    return "/static/uploads/" + filename
 
-
-def is_admin():
-    supplied = request.headers.get("X-Admin-Key", "")
-    if not supplied:
-        supplied = request.args.get("admin_key", "")
-    if not supplied:
-        supplied = request.form.get("admin_key", "")
-    if not supplied and request.is_json:
-        supplied = (request.get_json(silent=True) or {}).get("admin_key", "")
-    return bool(ADMIN_KEY) and supplied == ADMIN_KEY
-
-
-def settings_dict():
-    with connect() as conn:
-        rows = conn.execute("SELECT key, value FROM settings").fetchall()
-    result = {row["key"]: row["value"] for row in rows}
-    for key in ("card_enabled", "bkash_enabled", "nagad_enabled", "cod_enabled"):
-        result[key] = result.get(key, "1") == "1"
-    try:
-        result["delivery_charge_bdt"] = float(result.get("delivery_charge_bdt", "60"))
-    except (TypeError, ValueError):
-        result["delivery_charge_bdt"] = 60
-    return result
-
-
-def product_dict(row):
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "category": row["category"] or "",
-        "description": row["description"] or "",
-        "price_bdt": float(row["price_bdt"] or 0),
-        "stock": int(row["stock"] or 0),
-        "image_url": row["image_url"] or "",
-        "active": bool(row["active"]),
-        "currency": "BDT",
-    }
-
-
-def read_payload():
-    data = request.get_json(silent=True)
-    if isinstance(data, dict):
-        return data
-    return request.form.to_dict()
-
+def authorized():
+    return ADMIN_KEY != "change-me" and request.headers.get("X-Admin-Key","") == ADMIN_KEY
 
 @app.get("/")
 def home():
-    return jsonify({
-        "name": "Qayes Online Shop API",
-        "status": "running",
-        "currency": "BDT",
-        "admin": "/admin",
-        "products": "/api/v1/products",
-    })
-
+    return jsonify(name="Qayes Online Shop API",status="running",currency="BDT")
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
-
+    return jsonify(status="ok")
 
 @app.get("/api/v1/products")
-def list_products():
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM products WHERE active = 1 ORDER BY id DESC"
-        ).fetchall()
-    return jsonify({"items": [product_dict(row) for row in rows], "currency": "BDT"})
-
-
-@app.get("/api/v1/categories")
-def list_categories():
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT category FROM products WHERE active = 1 "
-            "AND category != '' ORDER BY category"
-        ).fetchall()
-    return jsonify({"items": [row["category"] for row in rows]})
-
+def products():
+    with db() as c:
+        rows = c.execute("SELECT * FROM products WHERE active=1 ORDER BY id DESC").fetchall()
+    return jsonify(items=[dict(r) for r in rows])
 
 @app.get("/api/v1/settings")
 def public_settings():
-    return jsonify(settings_dict())
-
-
-@app.get("/api/v1/admin/settings")
-def admin_get_settings():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized. Check Admin Key."}), 401
-    return jsonify(settings_dict())
-
-
-@app.put("/api/v1/admin/settings")
-@app.post("/api/v1/admin/settings")
-def admin_save_settings():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized. Check Admin Key."}), 401
-    data = read_payload()
-    allowed = {
-        "shop_name", "delivery_charge_bdt",
-        "card_enabled", "bkash_enabled", "nagad_enabled", "cod_enabled",
-    }
-    with connect() as conn:
-        for key in allowed:
-            if key not in data:
-                continue
-            value = data[key]
-            if key.endswith("_enabled"):
-                value = "1" if str(value).lower() in ("1", "true", "yes", "on") else "0"
-            elif key == "delivery_charge_bdt":
-                try:
-                    value = str(max(0, float(value)))
-                except (TypeError, ValueError):
-                    return jsonify({"error": "Delivery charge must be a number."}), 400
-            else:
-                value = str(value).strip()[:120]
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
-    return jsonify({"ok": True, "settings": settings_dict()})
-
+    s=settings()
+    return jsonify({k:s.get(k) for k in ("shop_name","delivery_charge_bdt","card_enabled","bkash_enabled","nagad_enabled","cod_enabled")})
 
 @app.post("/api/v1/admin/products")
-def admin_add_product():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized. Check Admin Key."}), 401
-    data = read_payload()
-
-    # Accept both JSON requests and standard HTML form submissions.
-    name = str(data.get("name") or data.get("product_name") or "").strip()
-    if not name:
-        return jsonify({"error": "Product name is required. Enter a product name."}), 400
-
-    category = str(data.get("category") or "").strip()
-    description = str(data.get("description") or "").strip()
-    image_url = str(data.get("image_url") or data.get("image") or "").strip()
-
+def api_add_product():
+    if not authorized():
+        return jsonify(error="Unauthorized"),401
+    d=request.form if request.form else (request.get_json(silent=True) or {})
     try:
-        price = float(data.get("price_bdt", data.get("price", 0)) or 0)
-        stock = int(float(data.get("stock", 0) or 0))
-        if price < 0 or stock < 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        return jsonify({"error": "Price and stock must be valid non-negative numbers."}), 400
-
-    with connect() as conn:
-        cursor = conn.execute(
-            """INSERT INTO products
-               (name, category, description, price_bdt, stock, image_url, active)
-               VALUES (?, ?, ?, ?, ?, ?, 1)""",
-            (name, category, description, price, stock, image_url),
-        )
-        product_id = cursor.lastrowid
-        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-    return jsonify({"ok": True, "item": product_dict(row)}), 201
-
-
-@app.put("/api/v1/admin/products/<int:product_id>")
-def admin_edit_product(product_id):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized. Check Admin Key."}), 401
-    data = read_payload()
-    with connect() as conn:
-        old = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-        if old is None:
-            return jsonify({"error": "Product not found."}), 404
-
-        name = str(data.get("name", old["name"]) or "").strip()
+        image_url=str(d.get("image_url","")).strip()
+        if request.files.get("image"):
+            image_url=save_image(request.files["image"])
+        name=str(d.get("name","")).strip()
         if not name:
-            return jsonify({"error": "Product name is required."}), 400
-        category = str(data.get("category", old["category"] or "") or "").strip()
-        description = str(data.get("description", old["description"] or "") or "").strip()
-        image_url = str(data.get("image_url", old["image_url"] or "") or "").strip()
-        try:
-            price = float(data.get("price_bdt", old["price_bdt"]) or 0)
-            stock = int(float(data.get("stock", old["stock"]) or 0))
-            if price < 0 or stock < 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            return jsonify({"error": "Price and stock must be valid non-negative numbers."}), 400
+            return jsonify(error="Product name is required"),400
+        with db() as c:
+            cur=c.execute("INSERT INTO products(name,category,description,price_bdt,stock,image_url) VALUES(?,?,?,?,?,?)",
+                (name,d.get("category",""),d.get("description",""),float(d.get("price_bdt",0)),int(d.get("stock",0)),image_url))
+        return jsonify(ok=True,id=cur.lastrowid,image_url=image_url),201
+    except ValueError as e:
+        return jsonify(error=str(e)),400
 
-        conn.execute(
-            """UPDATE products
-               SET name=?, category=?, description=?, price_bdt=?, stock=?, image_url=?
-               WHERE id=?""",
-            (name, category, description, price, stock, image_url, product_id),
-        )
-        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-    return jsonify({"ok": True, "item": product_dict(row)})
+@app.put("/api/v1/admin/products/<int:pid>")
+def edit_product(pid):
+    if not authorized(): return jsonify(error="Unauthorized"),401
+    d=request.get_json(silent=True) or {}
+    fields=[k for k in ("name","category","description","price_bdt","stock","image_url","active") if k in d]
+    if fields:
+        with db() as c:
+            c.execute("UPDATE products SET "+",".join(k+"=?" for k in fields)+" WHERE id=?",
+                      [d[k] for k in fields]+[pid])
+    return jsonify(ok=True)
 
+@app.delete("/api/v1/admin/products/<int:pid>")
+def delete_product(pid):
+    if not authorized(): return jsonify(error="Unauthorized"),401
+    with db() as c: c.execute("UPDATE products SET active=0 WHERE id=?",(pid,))
+    return jsonify(ok=True)
 
-@app.delete("/api/v1/admin/products/<int:product_id>")
-def admin_delete_product(product_id):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized. Check Admin Key."}), 401
-    with connect() as conn:
-        cursor = conn.execute("UPDATE products SET active=0 WHERE id=?", (product_id,))
-        if cursor.rowcount == 0:
-            return jsonify({"error": "Product not found."}), 404
-    return jsonify({"ok": True})
+@app.route("/admin",methods=["GET","POST"])
+def admin():
+    msg=""
+    key=request.form.get("admin_key","")
+    if request.method=="POST":
+        action=request.form.get("action","")
+        if key != ADMIN_KEY or ADMIN_KEY=="change-me":
+            msg="Admin Key ভুল অথবা Render-এ ADMIN_KEY সেট করা নেই।"
+        elif action=="settings":
+            values={"shop_name":request.form.get("shop_name","Qayes Online Shop"),
+                    "delivery_charge_bdt":request.form.get("delivery_charge_bdt","60"),
+                    "card_enabled":"1" if request.form.get("card_enabled") else "0",
+                    "bkash_enabled":"1" if request.form.get("bkash_enabled") else "0",
+                    "nagad_enabled":"1" if request.form.get("nagad_enabled") else "0",
+                    "cod_enabled":"1" if request.form.get("cod_enabled") else "0"}
+            with db() as c:
+                for k,v in values.items(): c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(k,v))
+            msg="Shop Settings সংরক্ষণ হয়েছে।"
+        elif action=="add":
+            try:
+                image_url=request.form.get("image_url","").strip()
+                if request.files.get("image"): image_url=save_image(request.files["image"])
+                name=request.form.get("name","").strip()
+                if not name: raise ValueError("পণ্যের নাম দিন।")
+                with db() as c:
+                    c.execute("INSERT INTO products(name,category,description,price_bdt,stock,image_url) VALUES(?,?,?,?,?,?)",
+                    (name,request.form.get("category",""),request.form.get("description",""),
+                     float(request.form.get("price_bdt",0)),int(request.form.get("stock",0)),image_url))
+                msg="পণ্য যোগ হয়েছে।"
+            except ValueError as e: msg=str(e)
+    s=settings()
+    with db() as c: rows=c.execute("SELECT * FROM products WHERE active=1 ORDER BY id DESC").fetchall()
+    html=r"""
+<!doctype html><html lang="bn"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qayes Online Shop Admin</title><style>
+body{font-family:Arial,sans-serif;background:#f3f5f7;margin:0;padding:14px;color:#222}
+.box{background:white;padding:16px;border-radius:12px;margin:12px 0}input,textarea{box-sizing:border-box;width:100%;padding:11px;border:1px solid #bbb;border-radius:6px}
+label{display:block;margin:10px 0 5px}button{background:#111;color:white;border:0;padding:11px 15px;border-radius:7px;margin-top:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.check{display:flex;align-items:center;gap:8px}.check input{width:auto}
+.msg{background:#e4f6e7;padding:10px;border-radius:6px}.hint{font-size:13px;color:#555}.item{border-top:1px solid #ddd;padding:12px 0}
+.item img{width:110px;height:110px;object-fit:contain;background:#f5f5f5}
+</style><h2>Qayes Online Shop — Admin</h2>
+{% if msg %}<p class="msg">{{msg}}</p>{% endif %}
+<div class="box"><form method="post" enctype="multipart/form-data">
+<label>Admin Key</label><input type="password" name="admin_key" value="{{key}}" required>
+<h3>Shop Settings</h3><label>Shop Name</label><input name="shop_name" value="{{s.get('shop_name','Qayes Online Shop')}}">
+<label>Delivery Charge (BDT)</label><input name="delivery_charge_bdt" type="number" min="0" value="{{s.get('delivery_charge_bdt','60')}}">
+<div class="grid">
+<label class="check"><input type="checkbox" name="card_enabled" {% if s.get('card_enabled','1')=='1' %}checked{% endif %}> Card</label>
+<label class="check"><input type="checkbox" name="bkash_enabled" {% if s.get('bkash_enabled','1')=='1' %}checked{% endif %}> bKash</label>
+<label class="check"><input type="checkbox" name="nagad_enabled" {% if s.get('nagad_enabled','1')=='1' %}checked{% endif %}> Nagad</label>
+<label class="check"><input type="checkbox" name="cod_enabled" {% if s.get('cod_enabled','1')=='1' %}checked{% endif %}> Cash on Delivery</label></div>
+<button name="action" value="settings">Save Settings</button></form></div>
+<div class="box"><h3>Add Product</h3><form method="post" enctype="multipart/form-data">
+<input type="hidden" name="admin_key" value="{{key}}">
+<label>Product Name</label><input name="name" required><label>Category</label><input name="category">
+<label>Description</label><textarea name="description" rows="3"></textarea>
+<div class="grid"><div><label>Price (BDT)</label><input name="price_bdt" type="number" min="0" step="0.01" required></div>
+<div><label>Stock</label><input name="stock" type="number" min="0" value="0" required></div></div>
+<label>মোবাইল গ্যালারি থেকে পণ্যের ছবি বাছুন</label><input type="file" name="image" accept="image/png,image/jpeg,image/webp,image/gif">
+<p class="hint">সর্বোচ্চ 5 MB · JPG, PNG, WEBP বা GIF</p>
+<label>অথবা Image URL</label><input name="image_url" placeholder="https://...">
+<button name="action" value="add">Add Product</button></form></div>
+<div class="box"><h3>Products ({{rows|length}})</h3>{% for p in rows %}<div class="item">
+{% if p['image_url'] %}<img src="{{p['image_url']}}" alt="product"><br>{% endif %}
+<strong>{{p['name']}}</strong><br>৳{{p['price_bdt']}} · Stock: {{p['stock']}}</div>{% else %}No products yet{% endfor %}</div>
+</html>"""
+    return render_template_string(html,msg=msg,key=key,s=s,rows=rows)
 
-
-ADMIN_HTML = r"""
-<!doctype html>
-<html lang="bn">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Qayes Online Shop — Admin</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#222;font:16px Arial,sans-serif}
-main{max-width:850px;margin:auto;padding:14px}h2{font-size:22px}
-.card{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 4px #ddd}
-label{display:block;margin:10px 0 5px;font-weight:600;font-size:14px}
-input,textarea{width:100%;padding:12px;border:1px solid #bbb;border-radius:6px;font-size:16px}
-button{background:#111;color:white;border:0;border-radius:6px;padding:11px 15px;margin-top:10px;font-size:15px}
-.checkrow{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee}
-.checkrow input{width:22px;height:22px}.muted{color:#666;font-size:13px}
-.item{display:flex;gap:12px;border-top:1px solid #eee;padding:12px 0;align-items:flex-start}
-.item img{width:78px;height:78px;object-fit:cover;border-radius:6px;background:#eee}
-.item .details{flex:1;min-width:0;overflow-wrap:anywhere}.item button{margin-right:5px}
-#notice{padding:10px;border-radius:6px;margin-top:10px;display:none}
-</style>
-</head>
-<body><main>
-<h2>Qayes Online Shop — Admin</h2>
-<div class="card">
-<label for="adminKey">Admin Key</label>
-<input id="adminKey" type="password" autocomplete="off" placeholder="Render-এর ADMIN_KEY লিখুন">
-<button onclick="refreshAll()">Refresh</button>
-<div class="muted">Admin Key কাউকে পাঠাবেন না।</div>
-<div id="notice"></div>
-</div>
-
-<div class="card">
-<h3>Shop Settings</h3>
-<label for="shopName">Shop Name</label><input id="shopName" value="Qayes Online Shop">
-<label for="delivery">Delivery Charge (BDT)</label><input id="delivery" type="number" min="0" value="60">
-<div class="checkrow"><span>Card</span><input id="card" type="checkbox" checked></div>
-<div class="checkrow"><span>bKash</span><input id="bkash" type="checkbox" checked></div>
-<div class="checkrow"><span>Nagad</span><input id="nagad" type="checkbox" checked></div>
-<div class="checkrow"><span>Cash on Delivery</span><input id="cod" type="checkbox" checked></div>
-<button onclick="saveSettings()">Save Settings</button>
-<p class="muted">কার্ড/bKash/Nagad পেমেন্ট চালু করতে আলাদা অনুমোদিত payment gateway লাগবে।</p>
-</div>
-
-<div class="card">
-<h3 id="productTitle">Add Product</h3>
-<input id="productId" type="hidden">
-<label for="name">Product Name *</label><input id="name" placeholder="যেমন: হলুদের গুঁড়া">
-<label for="category">Category</label><input id="category" placeholder="যেমন: মসলা">
-<label for="description">Description</label><textarea id="description" rows="3" placeholder="পণ্যের বিবরণ"></textarea>
-<label for="price">Price (BDT)</label><input id="price" type="number" min="0" step="0.01" value="0">
-<label for="stock">Stock</label><input id="stock" type="number" min="0" step="1" value="0">
-<label for="imageUrl">Image URL (optional)</label><input id="imageUrl" type="url" placeholder="https://...">
-<button onclick="saveProduct()">Save Product</button>
-<button onclick="clearProduct()" style="background:#666">Clear</button>
-</div>
-
-<div class="card"><h3>Products</h3><div id="products">Loading…</div></div>
-</main>
-<script>
-const $ = id => document.getElementById(id);
-function key(){return $('adminKey').value.trim();}
-function headers(){return {'Content-Type':'application/json','X-Admin-Key':key()};}
-function notice(message, bad=false){
-  const n=$('notice'); n.style.display='block'; n.style.background=bad?'#ffe3e3':'#e0f7e8';
-  n.style.color=bad?'#8b0000':'#075b2a'; n.textContent=message;
-}
-async function api(url, options={}){
-  const response=await fetch(url,{...options,headers:{...headers(),...(options.headers||{})}});
-  let data={}; try{data=await response.json();}catch(e){}
-  if(!response.ok) throw new Error(data.error || ('Request failed: '+response.status));
-  return data;
-}
-async function refreshAll(){
-  if(!key()){notice('আগে Admin Key লিখুন।',true);return;}
-  try{
-    const s=await api('/api/v1/admin/settings');
-    $('shopName').value=s.shop_name || 'Qayes Online Shop';
-    $('delivery').value=s.delivery_charge_bdt ?? 60;
-    $('card').checked=!!s.card_enabled; $('bkash').checked=!!s.bkash_enabled;
-    $('nagad').checked=!!s.nagad_enabled; $('cod').checked=!!s.cod_enabled;
-    await loadProducts(); notice('Settings ও Products লোড হয়েছে।');
-  }catch(e){notice(e.message,true);}
-}
-async function saveSettings(){
-  if(!key()){notice('আগে Admin Key লিখুন।',true);return;}
-  try{
-    await api('/api/v1/admin/settings',{method:'PUT',body:JSON.stringify({
-      shop_name:$('shopName').value,delivery_charge_bdt:$('delivery').value,
-      card_enabled:$('card').checked,bkash_enabled:$('bkash').checked,
-      nagad_enabled:$('nagad').checked,cod_enabled:$('cod').checked
-    })});
-    notice('Shop Settings সংরক্ষণ হয়েছে।');
-  }catch(e){notice(e.message,true);}
-}
-async function saveProduct(){
-  if(!key()){notice('আগে Admin Key লিখুন।',true);return;}
-  const payload={name:$('name').value,category:$('category').value,
-    description:$('description').value,price_bdt:$('price').value,
-    stock:$('stock').value,image_url:$('imageUrl').value};
-  try{
-    const id=$('productId').value;
-    if(id) await api('/api/v1/admin/products/'+id,{method:'PUT',body:JSON.stringify(payload)});
-    else await api('/api/v1/admin/products',{method:'POST',body:JSON.stringify(payload)});
-    clearProduct(); await loadProducts(); notice(id?'Product updated.':'Product added successfully.');
-  }catch(e){notice(e.message,true);}
-}
-function clearProduct(){
-  $('productId').value=''; $('productTitle').textContent='Add Product';
-  $('name').value=''; $('category').value=''; $('description').value='';
-  $('price').value='0'; $('stock').value='0'; $('imageUrl').value='';
-}
-async function loadProducts(){
-  const data=await api('/api/v1/products');
-  const list=data.items||[];
-  if(!list.length){$('products').innerHTML='<p>No products yet</p>';return;}
-  $('products').innerHTML=list.map(p=>`<div class="item">
-    ${p.image_url?`<img src="${escapeHtml(p.image_url)}" alt="" onerror="this.style.display='none'">`:'<div style="width:78px;height:78px;background:#eee;border-radius:6px"></div>'}
-    <div class="details"><b>${escapeHtml(p.name)}</b><br>৳${Number(p.price_bdt).toFixed(2)} · Stock: ${p.stock}
-    <br><span class="muted">${escapeHtml(p.category||'')}</span><br>
-    <button onclick="editProduct(${p.id})">Edit</button>
-    <button onclick="deleteProduct(${p.id})" style="background:#a40000">Delete</button></div></div>`).join('');
-}
-function escapeHtml(value){
- return String(value??'').replace(/[&<>"']/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-}
-async function editProduct(id){
- try{
-  const data=await api('/api/v1/products');const p=(data.items||[]).find(x=>x.id===id);
-  if(!p) throw new Error('Product not found');
-  $('productId').value=p.id;$('productTitle').textContent='Edit Product';
-  $('name').value=p.name;$('category').value=p.category;$('description').value=p.description;
-  $('price').value=p.price_bdt;$('stock').value=p.stock;$('imageUrl').value=p.image_url;
-  window.scrollTo({top:0,behavior:'smooth'});
- }catch(e){notice(e.message,true);}
-}
-async function deleteProduct(id){
- if(!confirm('এই পণ্যটি মুছবেন?'))return;
- try{await api('/api/v1/admin/products/'+id,{method:'DELETE'});await loadProducts();notice('Product deleted.');}
- catch(e){notice(e.message,true);}
-}
-</script></body></html>
-"""
-
-
-@app.get("/admin")
-def admin_page():
-    return render_template_string(ADMIN_HTML)
-
-
-init_db()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+init()
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT","10000")))
